@@ -14,6 +14,7 @@ ROLE_P2P_NOTARY = 32
 # Operation: this case tests the role designation methods(getDesignatedByRole, designateAsRole).
 #  1. the getDesignatedByRole returns the designated role for the given role.
 #  2. the designateAsRole designates the given role to the given account.
+#  3. the designateAsRole rejects duplicate public keys.
 # Expect Result: The role designation methods are working as expected.
 class DesignateRole(Testing):
 
@@ -85,32 +86,36 @@ class DesignateRole(Testing):
     def _public_key_stack_item(self, public_key) -> dict:
         return {'type': 'ByteString', 'value': base64.b64encode(public_key.to_array()).decode('utf-8')}
 
-    def _set_role_with_committee(self, role: int, nodes: list):
-        # Step 1: build the committee transaction
+    def _send_designate_role_tx(self, role: int, public_keys: list):
         block_index = self.client.get_block_index()
         script = ScriptBuilder().emit_dynamic_call(
             script_hash=ROLE_MANAGEMENT_CONTRACT_HASH,
             method='designateAsRole',
             call_flags=CallFlags.STATES | CallFlags.ALLOW_NOTIFY,
-            args=[role, [node.public_key for node in nodes]],
+            args=[role, public_keys],
         ).to_bytes()
         tx = self.make_multisig_tx(script, self.default_sysfee, self.default_netfee,
                                    block_index + 10, is_committee=True)
 
-        # Step 2: send the transaction
         tx_id = self.client.send_raw_tx(tx.to_array())['hash']
         self.logger.info(f"designateAsRole transaction sent: {tx_id}")
 
-        # Step 3: wait for the next block
         block_index = self.client.get_block_index()
         persisted_index = self.wait_next_block(block_index, wait_while=f"waiting for designateAsRole tx {tx_id}")
 
-        # Step 4: check the application log
         application_log = self.client.get_application_log(tx_id)
         self.logger.info(f"designateAsRole application log: {application_log}")
         assert 'txid' in application_log and tx_id == application_log['txid']
         assert 'executions' in application_log and len(application_log['executions']) == 1
-        execution = application_log['executions'][0]
+        return persisted_index, application_log['executions'][0]
+
+    def _set_role_with_duplicate_nodes(self):
+        duplicated = [self.env.validators[0].public_key, self.env.validators[0].public_key]
+        _, execution = self._send_designate_role_tx(ROLE_ORACLE, duplicated)
+        self.check_execution_result(execution, exception='Duplicate publickeys are not allowed')
+
+    def _set_role_with_committee(self, role: int, nodes: list):
+        persisted_index, execution = self._send_designate_role_tx(role, [node.public_key for node in nodes])
         self.check_execution_result(execution, stack=[('Any', None)])
 
         notifications = execution['notifications']
@@ -148,7 +153,10 @@ class DesignateRole(Testing):
         # Step 6: check set role with not committee
         self._set_role_with_not_committee(block_index)
 
-        # Step 7: check set role with valid nodes
+        # Step 7: check set role with duplicate public keys
+        self._set_role_with_duplicate_nodes()
+
+        # Step 8: check set role with valid nodes
         nodes = [self.env.validators[0]]
         effective_index = self._set_role_with_committee(ROLE_NEOFS_ALPHABET_NODE, nodes)
         self._get_designated_by_role(ROLE_NEOFS_ALPHABET_NODE, effective_index,
